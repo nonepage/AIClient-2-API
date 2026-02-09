@@ -12,6 +12,8 @@ import { countTokens } from '@anthropic-ai/tokenizer';
 import { configureAxiosProxy } from '../../utils/proxy-utils.js';
 import { isRetryableNetworkError, MODEL_PROVIDER, formatExpiryLog } from '../../utils/common.js';
 import { getProviderPoolManager } from '../../services/service-manager.js';
+import { hashString } from '../../utils/crypto-utils.js';
+import { getRedisService } from '../../services/redis-cache.js';
 
 const KIRO_THINKING = {
     MAX_BUDGET_TOKENS: 24576,
@@ -379,6 +381,41 @@ export class KiroApiService {
         this.modelName = KIRO_CONSTANTS.DEFAULT_MODEL_NAME;
         this.axiosInstance = null; // Initialize later in async method
         this.axiosSocialRefreshInstance = null;
+    }
+
+    /**
+     * Extract session UUID from request metadata
+     * Priority: metadata.user_id pattern match > hash of user_id > API key > generated UUID
+     * @param {Object} requestBody - Request body containing metadata
+     * @returns {string} Session identifier
+     * @private
+     */
+    _extractSessionId(requestBody) {
+        // Try to extract from metadata.user_id
+        const userId = requestBody?.metadata?.user_id;
+        
+        if (userId) {
+            // Try pattern match: user_xxx_session_{uuid}
+            const match = userId.match(/user_[^_]+_session_([a-f0-9-]{36})/i);
+            if (match && match[1]) {
+                logger.debug(`[Kiro] Session UUID extracted from metadata: ${match[1]}`);
+                return match[1];
+            }
+            
+            // Fallback: hash the entire user_id
+            logger.debug('[Kiro] Session UUID pattern not matched, using hash of user_id');
+            return hashString(userId);
+        }
+        
+        // Fallback: use API key if available
+        if (this.config.CLAUDE_API_KEY) {
+            logger.debug('[Kiro] No metadata.user_id, using API key as session ID');
+            return hashString(this.config.CLAUDE_API_KEY);
+        }
+        
+        // Last resort: generate new UUID
+        logger.warn('[Kiro] No session identifier available, generating new UUID');
+        return uuidv4();
     }
  
     async initialize() {
@@ -1685,11 +1722,46 @@ async saveCredentialsToFile(filePath, newData) {
         // Estimate input tokens before making the API call
         const inputTokens = this.estimateInputTokens(requestBody);
         
+        // Redis prompt caching - extract session and compute cache
+        const sessionId = this._extractSessionId(requestBody);
+        let cacheResult = {
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            uncached_input_tokens: 0
+        };
+
+        try {
+            const redisService = getRedisService(this.config);
+            if (redisService.isEnabled) {
+                await redisService.initialize();
+                
+                const breakpoints = redisService.computeBreakpoints(
+                    requestBody.tools,
+                    requestBody.system,
+                    requestBody.messages
+                );
+                
+                cacheResult = await redisService.lookupOrCreate(sessionId, breakpoints, inputTokens);
+                
+                logger.debug(`[Kiro] Cache result: read=${cacheResult.cache_read_input_tokens}, creation=${cacheResult.cache_creation_input_tokens}`);
+            }
+        } catch (error) {
+            logger.warn(`[Kiro] Cache operation failed: ${error.message}`);
+        }
+        
         const response = await this.callApi('', finalModel, requestBody);
 
         try {
             const { responseText, toolCalls } = this._processApiResponse(response);
-            return this.buildClaudeResponse(responseText, false, 'assistant', model, toolCalls, inputTokens);
+            const result = this.buildClaudeResponse(responseText, false, 'assistant', model, toolCalls, inputTokens);
+            
+            // Add cache tokens to usage object
+            if (result && result.usage) {
+                result.usage.cache_creation_input_tokens = cacheResult.cache_creation_input_tokens;
+                result.usage.cache_read_input_tokens = cacheResult.cache_read_input_tokens;
+            }
+            
+            return result;
         } catch (error) {
             logger.error('[Kiro] Error in generateContent:', error);
             throw new Error(`Error processing response: ${error.message}`);
@@ -2051,6 +2123,34 @@ async saveCredentialsToFile(filePath, newData) {
 
         const thinkingRequested = requestBody?.thinking?.type === 'enabled';
 
+        // Redis prompt caching - extract session and compute cache
+        const sessionId = this._extractSessionId(requestBody);
+        const estimatedInputTokens = this.estimateInputTokens(requestBody);
+        let cacheResult = {
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            uncached_input_tokens: 0
+        };
+
+        try {
+            const redisService = getRedisService(this.config);
+            if (redisService.isEnabled) {
+                await redisService.initialize();
+                
+                const breakpoints = redisService.computeBreakpoints(
+                    requestBody.tools,
+                    requestBody.system,
+                    requestBody.messages
+                );
+                
+                cacheResult = await redisService.lookupOrCreate(sessionId, breakpoints, estimatedInputTokens);
+                
+                logger.debug(`[Kiro] Cache result: read=${cacheResult.cache_read_input_tokens}, creation=${cacheResult.cache_creation_input_tokens}`);
+            }
+        } catch (error) {
+            logger.warn(`[Kiro] Cache operation failed: ${error.message}`);
+        }
+
         const streamState = {
             thinkingRequested,
             buffer: '',
@@ -2128,8 +2228,6 @@ async saveCredentialsToFile(filePath, newData) {
             const toolCalls = [];
             let currentToolCall = null; // 用于累积结构化工具调用
 
-            const estimatedInputTokens = this.estimateInputTokens(requestBody);
-
             // 1. 先发送 message_start 事件
             yield {
                 type: "message_start",
@@ -2141,8 +2239,8 @@ async saveCredentialsToFile(filePath, newData) {
                     usage: {
                         input_tokens: estimatedInputTokens,
                         output_tokens: 0,
-                        cache_creation_input_tokens: 0,
-                        cache_read_input_tokens: 0
+                        cache_creation_input_tokens: cacheResult.cache_creation_input_tokens,
+                        cache_read_input_tokens: cacheResult.cache_read_input_tokens
                     },
                     content: []
                 }
@@ -2390,8 +2488,8 @@ async saveCredentialsToFile(filePath, newData) {
                 usage: {
                     input_tokens: inputTokens,
                     output_tokens: outputTokens,
-                    cache_creation_input_tokens: 0,
-                    cache_read_input_tokens: 0
+                    cache_creation_input_tokens: cacheResult.cache_creation_input_tokens,
+                    cache_read_input_tokens: cacheResult.cache_read_input_tokens
                 }
             };
 
