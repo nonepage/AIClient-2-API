@@ -187,8 +187,17 @@ export class RedisCacheService {
 
     /**
      * Compute cache breakpoints from request components
-     * Follows kiro-rs logic: tools (sorted by name) → system → messages
-     * Only creates breakpoints where cache_control field exists
+     * 
+     * IMPORTANT: Anthropic prompt caching is PREFIX-based. The cache key (hash) should only
+     * include content UP TO AND INCLUDING the cache_control marker. Content AFTER the last
+     * cache_control marker should NOT affect the hash of previous breakpoints.
+     * 
+     * This means:
+     * - We process tools → system → messages in order
+     * - We accumulate hash as we go
+     * - We ONLY create a breakpoint when we encounter cache_control
+     * - The hash at each breakpoint represents ALL content up to that point
+     * - Content after the last cache_control does NOT invalidate previous cache entries
      * 
      * @param {Array<Object>|null} tools - Array of tool definitions
      * @param {Array<Object>|string|null} system - System prompt(s)
@@ -249,6 +258,12 @@ export class RedisCacheService {
             
             for (const msg of systemArray) {
                 const text = typeof msg === 'string' ? msg : (msg.text || '');
+                
+                // Skip system entries containing x-anthropic-billing-header to prevent cache busting
+                if (text && text.includes('x-anthropic-billing-header')) {
+                    continue;
+                }
+                
                 if (text) {
                     hasher.update(text);
                     try {
@@ -271,16 +286,52 @@ export class RedisCacheService {
             }
         }
 
-        // 3. Process messages
+        // 3. Process messages - ONLY up to and including blocks with cache_control
+        // Content after the last cache_control should not affect the hash
         if (messages && Array.isArray(messages)) {
-            for (const msg of messages) {
+            // First pass: find the last message index and block index with cache_control
+            let lastCacheControlMsgIdx = -1;
+            let lastCacheControlBlockIdx = -1;
+            
+            for (let msgIdx = 0; msgIdx < messages.length; msgIdx++) {
+                const msg = messages[msgIdx];
                 const content = msg.content;
                 
                 if (Array.isArray(content)) {
+                    for (let blockIdx = 0; blockIdx < content.length; blockIdx++) {
+                        if (content[blockIdx].cache_control) {
+                            lastCacheControlMsgIdx = msgIdx;
+                            lastCacheControlBlockIdx = blockIdx;
+                        }
+                    }
+                }
+            }
+            
+            // Second pass: process messages only up to the last cache_control
+            // This ensures that new messages after the cached prefix don't invalidate the cache
+            for (let msgIdx = 0; msgIdx < messages.length; msgIdx++) {
+                const msg = messages[msgIdx];
+                const content = msg.content;
+                
+                // If we're past the last message with cache_control, stop processing for hash
+                if (msgIdx > lastCacheControlMsgIdx) {
+                    break;
+                }
+                
+                if (Array.isArray(content)) {
                     // Content is array of blocks
-                    for (const block of content) {
-                        // Update hash with block JSON
-                        const blockJson = stableStringify(block);
+                    for (let blockIdx = 0; blockIdx < content.length; blockIdx++) {
+                        const block = content[blockIdx];
+                        
+                        // If we're in the last cache_control message but past the cache_control block, stop
+                        if (msgIdx === lastCacheControlMsgIdx && blockIdx > lastCacheControlBlockIdx) {
+                            break;
+                        }
+                        
+                        // Create a normalized block for hashing (exclude cache_control field itself)
+                        const blockForHash = { ...block };
+                        delete blockForHash.cache_control;
+                        const blockJson = stableStringify(blockForHash);
                         hasher.update(blockJson);
 
                         // Estimate tokens from text content
@@ -289,6 +340,15 @@ export class RedisCacheService {
                                 cumulativeTokens += countTokens(block.text);
                             } catch (e) {
                                 cumulativeTokens += Math.ceil(block.text.length / 4);
+                            }
+                        }
+                        
+                        // Also count tokens for thinking blocks
+                        if (block.thinking) {
+                            try {
+                                cumulativeTokens += countTokens(block.thinking);
+                            } catch (e) {
+                                cumulativeTokens += Math.ceil(block.thinking.length / 4);
                             }
                         }
 
@@ -303,12 +363,15 @@ export class RedisCacheService {
                         }
                     }
                 } else if (typeof content === 'string') {
-                    // Content is plain string
-                    hasher.update(content);
-                    try {
-                        cumulativeTokens += countTokens(content);
-                    } catch (e) {
-                        cumulativeTokens += Math.ceil(content.length / 4);
+                    // Content is plain string - only process if this message has cache_control potential
+                    // (string content can't have cache_control, so we only include it if it's before a cache_control)
+                    if (msgIdx < lastCacheControlMsgIdx || (msgIdx === lastCacheControlMsgIdx && lastCacheControlBlockIdx === -1)) {
+                        hasher.update(content);
+                        try {
+                            cumulativeTokens += countTokens(content);
+                        } catch (e) {
+                            cumulativeTokens += Math.ceil(content.length / 4);
+                        }
                     }
                 }
             }
@@ -316,6 +379,7 @@ export class RedisCacheService {
 
         logger.debug(
             `[Redis Cache] Breakpoints computed: count=${breakpoints.length}, ` +
+            `tokens_at_last_breakpoint=${cumulativeTokens}, ` +
             `tools=${tools?.length || 0}, system=${Array.isArray(system) ? system.length : (system ? 1 : 0)}, ` +
             `messages=${messages?.length || 0}`
         );
