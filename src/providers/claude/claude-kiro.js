@@ -395,15 +395,15 @@ export class KiroApiService {
         const userId = requestBody?.metadata?.user_id;
         
         if (userId) {
-            // Try pattern match: user_xxx_session_{uuid}
-            const match = userId.match(/user_[^_]+_session_([a-f0-9-]{36})/i);
+            // Try pattern match: _session_{uuid} (matches any format with _session_ prefix)
+            const match = userId.match(/_session_([a-f0-9-]{36})/i);
             if (match && match[1]) {
-                logger.debug(`[Kiro] Session UUID extracted from metadata: ${match[1]}`);
+                logger.info(`[Kiro] Session UUID extracted from metadata: ${match[1]}`);
                 return match[1];
             }
             
             // Fallback: hash the entire user_id
-            logger.debug('[Kiro] Session UUID pattern not matched, using hash of user_id');
+            logger.info(`[Kiro] Session UUID pattern not matched in user_id: ${userId.substring(0, 50)}..., using hash of user_id`);
             return hashString(userId);
         }
         
