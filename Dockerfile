@@ -1,10 +1,10 @@
-# 使用官方Node.js运行时作为基础镜像
-# 选择20-alpine版本以满足undici包的要求（需要Node.js >=20.18.1）
-FROM node:20-alpine
+# Multi-stage build optimized for ARM64 architecture
+# Stage 1: Builder - Install dependencies
+FROM node:20-alpine AS builder
 
 # 设置标签
 LABEL maintainer="AIClient2API Team"
-LABEL description="Docker image for AIClient2API server"
+LABEL description="Docker image for AIClient2API server - ARM64 optimized"
 
 # 安装必要的系统工具（tar 用于更新功能，git 用于版本检查）
 RUN apk add --no-cache tar git
@@ -15,12 +15,25 @@ WORKDIR /app
 # 复制package.json和package-lock.json（如果存在）
 COPY package*.json ./
 
-# 安装依赖
-# 使用--production标志只安装生产依赖，减小镜像大小
-# 使用--omit=dev来排除开发依赖
+# 安装依赖（包括生产和开发依赖用于构建）
 RUN npm install
 
-# 复制源代码
+# Stage 2: Runtime - Create minimal production image
+FROM node:20-alpine AS runtime
+
+# 安装运行时必需的系统工具
+RUN apk add --no-cache tar git
+
+# 设置工作目录
+WORKDIR /app
+
+# 从builder阶段复制node_modules
+COPY --from=builder /app/node_modules ./node_modules
+
+# 复制package.json
+COPY package*.json ./
+
+# 复制源代码（.dockerignore会自动排除configs/等敏感目录）
 COPY . .
 
 USER root
@@ -29,7 +42,11 @@ USER root
 RUN mkdir -p /app/logs
 
 # 暴露端口
-EXPOSE 3000 8085 8086 19876-19880
+# 3000: Web UI
+# 8085-8087: OAuth callbacks (Gemini, Antigravity, iFlow)
+# 1455: Codex OAuth callback
+# 19876-19880: Kiro OAuth callbacks
+EXPOSE 3000 8085 8086 8087 1455 19876-19880
 
 # 添加健康检查
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
