@@ -55,17 +55,40 @@ export class RedisCacheService {
         this.config = config;
         this.client = null;
         this.isInitialized = false;
-        this.isEnabled = config.REDIS_ENABLED ?? false;
         
-        // Redis connection settings
-        this.host = config.REDIS_HOST || 'localhost';
-        this.port = config.REDIS_PORT || 6379;
-        this.password = config.REDIS_PASSWORD || undefined;
-        this.db = config.REDIS_DB || 0;
+        // Environment variables take priority over config file
+        this.isEnabled = this._getEnvBool('REDIS_ENABLED', config.REDIS_ENABLED ?? false);
+        
+        // Redis connection settings (env > config > default)
+        this.host = process.env.REDIS_HOST || config.REDIS_HOST || 'localhost';
+        this.port = this._getEnvInt('REDIS_PORT', config.REDIS_PORT || 6379);
+        this.password = process.env.REDIS_PASSWORD || config.REDIS_PASSWORD || undefined;
+        this.db = this._getEnvInt('REDIS_DB', config.REDIS_DB || 0);
         
         // TTL settings
-        this.defaultTtl = config.REDIS_DEFAULT_TTL || DEFAULT_TTL_SECS;
-        this.extendedTtl = config.REDIS_EXTENDED_TTL || EXTENDED_TTL_SECS;
+        this.defaultTtl = this._getEnvInt('REDIS_DEFAULT_TTL', config.REDIS_DEFAULT_TTL || DEFAULT_TTL_SECS);
+        this.extendedTtl = this._getEnvInt('REDIS_EXTENDED_TTL', config.REDIS_EXTENDED_TTL || EXTENDED_TTL_SECS);
+    }
+
+    /**
+     * Get boolean value from environment variable
+     * @private
+     */
+    _getEnvBool(key, defaultValue) {
+        const val = process.env[key];
+        if (val === undefined) return defaultValue;
+        return val === 'true' || val === '1';
+    }
+
+    /**
+     * Get integer value from environment variable
+     * @private
+     */
+    _getEnvInt(key, defaultValue) {
+        const val = process.env[key];
+        if (val === undefined) return defaultValue;
+        const parsed = parseInt(val, 10);
+        return isNaN(parsed) ? defaultValue : parsed;
     }
 
     /**
