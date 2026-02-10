@@ -1423,7 +1423,7 @@ async saveCredentialsToFile(filePath, newData) {
     /**
      * 调用 API 并处理错误重试
      */
-    async callApi(method, model, body, isRetry = false, retryCount = 0) {
+    async callApi(method, model, body, isRetry = false, retryCount = 0, sessionId = null) {
         if (!this.isInitialized) await this.initialize();
         const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
         const baseDelay = this.config.REQUEST_BASE_DELAY || 1000; // 1 second base delay
@@ -1540,7 +1540,7 @@ async saveCredentialsToFile(filePath, newData) {
                 const errorIdentifier = errorCode || errorMessage.substring(0, 50);
                 logger.info(`[Kiro] Network error (${errorIdentifier}). Retrying in ${delay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
                 await new Promise(resolve => setTimeout(resolve, delay));
-                return this.callApi(method, model, body, isRetry, retryCount + 1);
+                return this.callApi(method, model, body, isRetry, retryCount + 1, sessionId);
             }
 
             logger.error(`[Kiro] API call failed (Status: ${status}, Code: ${errorCode}):`, error.message);
@@ -1776,7 +1776,7 @@ async saveCredentialsToFile(filePath, newData) {
             logger.warn(`[Kiro] Cache operation failed: ${error.message}`);
         }
         
-        const response = await this.callApi('', finalModel, requestBody);
+        const response = await this.callApi('', finalModel, requestBody, false, 0, sessionId);
 
         try {
             const { responseText, toolCalls } = this._processApiResponse(response);
@@ -1944,7 +1944,7 @@ async saveCredentialsToFile(filePath, newData) {
     /**
      * 真正的流式 API 调用 - 使用 responseType: 'stream'
      */
-    async * streamApiReal(method, model, body, isRetry = false, retryCount = 0) {
+    async * streamApiReal(method, model, body, isRetry = false, retryCount = 0, sessionId = null) {
         if (!this.isInitialized) await this.initialize();
         const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
         const baseDelay = this.config.REQUEST_BASE_DELAY || 1000;
@@ -2101,7 +2101,7 @@ async saveCredentialsToFile(filePath, newData) {
                 const errorIdentifier = errorCode || errorMessage.substring(0, 50);
                 logger.info(`[Kiro] Network error (${errorIdentifier}) in stream. Retrying in ${delay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
                 await new Promise(resolve => setTimeout(resolve, delay));
-                yield* this.streamApiReal(method, model, body, isRetry, retryCount + 1);
+                yield* this.streamApiReal(method, model, body, isRetry, retryCount + 1, sessionId);
                 return;
             }
 
@@ -2116,9 +2116,9 @@ async saveCredentialsToFile(filePath, newData) {
     }
 
     // 保留旧的非流式方法用于 generateContent
-    async streamApi(method, model, body, isRetry = false, retryCount = 0) {
+    async streamApi(method, model, body, isRetry = false, retryCount = 0, sessionId = null) {
         try {
-            return await this.callApi(method, model, body, isRetry, retryCount);
+            return await this.callApi(method, model, body, isRetry, retryCount, sessionId);
         } catch (error) {
             logger.error('[Kiro] Error calling API:', error);
             throw error;
@@ -2274,7 +2274,7 @@ async saveCredentialsToFile(filePath, newData) {
             };
 
             // 2. 流式接收并发送每个 content_block_delta
-            for await (const event of this.streamApiReal('', finalModel, requestBody)) {
+            for await (const event of this.streamApiReal('', finalModel, requestBody, false, 0, sessionId)) {
                 if (event.type === 'contextUsage' && event.contextUsagePercentage) {
                     // 捕获上下文使用百分比（包含输入和输出的总使用量）
                     contextUsagePercentage = event.contextUsagePercentage;
