@@ -1760,6 +1760,7 @@ async saveCredentialsToFile(filePath, newData) {
         try {
             const redisService = getRedisService(this.config);
             if (redisService.isEnabled) {
+                logger.info(`[Kiro] [Redis Cache] Enabled, initializing for session: ${sessionId}`);
                 await redisService.initialize();
                 
                 const breakpoints = redisService.computeBreakpoints(
@@ -1767,10 +1768,13 @@ async saveCredentialsToFile(filePath, newData) {
                     requestBody.system,
                     requestBody.messages
                 );
+                logger.info(`[Kiro] [Redis Cache] Computed ${breakpoints.length} breakpoints`);
                 
                 cacheResult = await redisService.lookupOrCreate(sessionId, breakpoints, inputTokens);
                 
-                logger.debug(`[Kiro] Cache result: read=${cacheResult.cache_read_input_tokens}, creation=${cacheResult.cache_creation_input_tokens}`);
+                logger.info(`[Kiro] [Redis Cache] Result: read=${cacheResult.cache_read_input_tokens}, creation=${cacheResult.cache_creation_input_tokens}, uncached=${cacheResult.uncached_input_tokens}`);
+            } else {
+                logger.debug(`[Kiro] [Redis Cache] Disabled, skipping local cache`);
             }
         } catch (error) {
             logger.warn(`[Kiro] Cache operation failed: ${error.message}`);
@@ -2162,6 +2166,7 @@ async saveCredentialsToFile(filePath, newData) {
         try {
             const redisService = getRedisService(this.config);
             if (redisService.isEnabled) {
+                logger.info(`[Kiro] [Redis Cache] Enabled, initializing for session: ${sessionId}`);
                 await redisService.initialize();
                 
                 const breakpoints = redisService.computeBreakpoints(
@@ -2169,10 +2174,13 @@ async saveCredentialsToFile(filePath, newData) {
                     requestBody.system,
                     requestBody.messages
                 );
+                logger.info(`[Kiro] [Redis Cache] Computed ${breakpoints.length} breakpoints`);
                 
                 cacheResult = await redisService.lookupOrCreate(sessionId, breakpoints, estimatedInputTokens);
                 
-                logger.debug(`[Kiro] Cache result: read=${cacheResult.cache_read_input_tokens}, creation=${cacheResult.cache_creation_input_tokens}`);
+                logger.info(`[Kiro] [Redis Cache] Result: read=${cacheResult.cache_read_input_tokens}, creation=${cacheResult.cache_creation_input_tokens}, uncached=${cacheResult.uncached_input_tokens}`);
+            } else {
+                logger.debug(`[Kiro] [Redis Cache] Disabled, skipping local cache`);
             }
         } catch (error) {
             logger.warn(`[Kiro] Cache operation failed: ${error.message}`);
