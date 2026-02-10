@@ -820,6 +820,29 @@ export async function handleModelListRequest(req, res, service, endpointType, CO
 }
 
 /**
+ * 从请求体中提取 sessionId 用于 session affinity
+ * 优先从 metadata.user_id 中提取 _session_ 模式的 UUID
+ * @param {Object} requestBody - 请求体
+ * @returns {string|null} - sessionId 或 null
+ * @private
+ */
+function _extractSessionIdFromRequest(requestBody) {
+    if (!requestBody) return null;
+    
+    const userId = requestBody?.metadata?.user_id;
+    if (!userId) return null;
+    
+    // 尝试从 user_id 中提取 _session_UUID 模式
+    const match = userId.match(/_session_([a-f0-9-]{36})/i);
+    if (match) {
+        return match[1];
+    }
+    
+    // 如果没有 _session_ 模式，使用整个 user_id 作为 sessionId
+    return userId;
+}
+
+/**
  * Handles requests for content generation (both unary and streaming). This function
  * orchestrates request body parsing, conversion to the internal Gemini format,
  * logging, and dispatching to the appropriate stream or unary handler.
@@ -866,7 +889,13 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
     // 注意：这里使用 skipUsageCount: true，因为初次选择时已经增加了 usageCount
     if (providerPoolManager && CONFIG.providerPools && CONFIG.providerPools[CONFIG.MODEL_PROVIDER]) {
         const { getApiServiceWithFallback } = await import('../services/service-manager.js');
-        const result = await getApiServiceWithFallback(CONFIG, model);
+        
+        // 提取 sessionId 用于 session affinity（同一用户优先使用同一账号）
+        // 优先从 metadata.user_id 提取，这样同一用户的请求会路由到同一个 provider
+        const sessionId = _extractSessionIdFromRequest(originalRequestBody);
+        const selectOptions = sessionId ? { sessionId } : {};
+        
+        const result = await getApiServiceWithFallback(CONFIG, model, selectOptions);
         
         service = result.service;
         toProvider = result.actualProviderType;

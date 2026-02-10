@@ -591,6 +591,20 @@ export class ProviderPoolManager {
             return null;
         }
 
+        // Session Affinity: 如果提供了 sessionId，优先选择与该 session 关联的 provider
+        // 这确保同一用户的请求尽可能使用同一个账号，提高缓存命中率
+        if (options.sessionId && availableAndHealthyProviders.length > 1) {
+            const affinityProvider = this._selectBySessionAffinity(
+                availableAndHealthyProviders, 
+                options.sessionId,
+                providerType
+            );
+            if (affinityProvider) {
+                return this._finalizeSelection(affinityProvider, providerType, requestedModel, options);
+            }
+            // 如果 affinity provider 不可用，继续使用常规选择逻辑
+        }
+
         // 改进：使用统一的评分策略进行选择
         // 传入当前时间戳 now 确保一致性
         const selected = availableAndHealthyProviders.sort((a, b) => {
@@ -601,6 +615,14 @@ export class ProviderPoolManager {
             return a.uuid < b.uuid ? -1 : 1;
         })[0];
 
+        return this._finalizeSelection(selected, providerType, requestedModel, options);
+    }
+
+    /**
+     * 完成 provider 选择的最终处理（更新状态、记录日志等）
+     * @private
+     */
+    _finalizeSelection(selected, providerType, requestedModel, options) {
         // 始终更新 lastUsed（确保 LRU 策略生效，避免并发请求选到同一个 provider）
         // usageCount 只在请求成功后才增加（由 skipUsageCount 控制）
         selected.config.lastUsed = new Date().toISOString();
@@ -610,7 +632,8 @@ export class ProviderPoolManager {
         selected.config._lastSelectionSeq = this._selectionSequence;
         
         // 强制打印选中日志，方便排查并发问题
-        this._log('info', `[Concurrency Control] Atomic selection: ${selected.config.uuid} (Seq: ${this._selectionSequence})`);
+        const affinityInfo = options.sessionId ? ` (Session: ${options.sessionId.substring(0, 8)}...)` : '';
+        this._log('info', `[Concurrency Control] Atomic selection: ${selected.config.uuid} (Seq: ${this._selectionSequence})${affinityInfo}`);
 
         if (!options.skipUsageCount) {
             selected.config.usageCount++;
@@ -618,9 +641,52 @@ export class ProviderPoolManager {
         // 使用防抖保存（文件 I/O 是异步的，但内存已经更新）
         this._debouncedSave(providerType);
 
-        this._log('debug', `Selected provider for ${providerType} (LRU): ${selected.config.uuid}${requestedModel ? ` for model: ${requestedModel}` : ''}${options.skipUsageCount ? ' (skip usage count)' : ''}`);
+        this._log('debug', `Selected provider for ${providerType}: ${selected.config.uuid}${requestedModel ? ` for model: ${requestedModel}` : ''}${options.skipUsageCount ? ' (skip usage count)' : ''}`);
         
         return selected.config;
+    }
+
+    /**
+     * 基于 sessionId 的一致性哈希选择 provider
+     * 确保同一 session 的请求优先使用同一个 provider
+     * @private
+     */
+    _selectBySessionAffinity(availableProviders, sessionId, providerType) {
+        if (!sessionId || availableProviders.length === 0) {
+            return null;
+        }
+
+        // 使用一致性哈希：将 sessionId 映射到 provider
+        // 按 UUID 排序确保顺序稳定
+        const sortedProviders = [...availableProviders].sort((a, b) => 
+            a.uuid.localeCompare(b.uuid)
+        );
+
+        // 计算 sessionId 的哈希值
+        const hash = this._hashString(sessionId);
+        const index = hash % sortedProviders.length;
+        const affinityProvider = sortedProviders[index];
+
+        this._log('info', 
+            `[Session Affinity] Session ${sessionId.substring(0, 8)}... -> ` +
+            `Provider ${affinityProvider.uuid} (index ${index}/${sortedProviders.length})`
+        );
+
+        return affinityProvider;
+    }
+
+    /**
+     * 简单的字符串哈希函数（用于 session affinity）
+     * @private
+     */
+    _hashString(str) {
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+            const char = str.charCodeAt(i);
+            hash = ((hash << 5) - hash) + char;
+            hash = hash & hash; // Convert to 32bit integer
+        }
+        return Math.abs(hash);
     }
 
     /**
