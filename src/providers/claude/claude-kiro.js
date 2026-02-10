@@ -391,6 +391,15 @@ export class KiroApiService {
      * @private
      */
     _extractSessionId(requestBody) {
+        // Log metadata for debugging
+        try {
+            const metadataStr = JSON.stringify(requestBody?.metadata || {});
+            const truncated = metadataStr.length > 500 ? metadataStr.substring(0, 500) + '...' : metadataStr;
+            logger.info(`[Kiro] Request metadata: ${truncated}`);
+        } catch (err) {
+            logger.warn(`[Kiro] Failed to log metadata: ${err.message}`);
+        }
+        
         // Try to extract from metadata.user_id
         const userId = requestBody?.metadata?.user_id;
         
