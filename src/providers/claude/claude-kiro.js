@@ -827,8 +827,8 @@ async saveCredentialsToFile(filePath, newData) {
     /**
      * Build CodeWhisperer request from OpenAI messages
      */
-    async buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null, thinking = null) {
-        const conversationId = uuidv4();
+    async buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null, thinking = null, sessionId = null) {
+        const conversationId = sessionId || uuidv4();
         
         let systemPrompt = this.getContentText(inSystemPrompt);
         const processedMessages = messages;
@@ -1442,7 +1442,7 @@ async saveCredentialsToFile(filePath, newData) {
             throw new Error('No messages found in request body');
         }
 
-        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking);
+        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking, sessionId);
 
         try {
             const token = this.accessToken; // Use the already initialized token
@@ -1963,7 +1963,7 @@ async saveCredentialsToFile(filePath, newData) {
             throw new Error('No messages found in request body');
         }
 
-        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking);
+        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking, sessionId);
 
         const token = this.accessToken;
         const headers = {
