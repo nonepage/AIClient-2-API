@@ -1334,6 +1334,7 @@ async saveCredentialsToFile(filePath, newData) {
         let fullContent = '';
         const toolCalls = [];
         let currentToolCallDict = null;
+        let contextUsagePercentage = null;
         // logger.info(`rawStr=${rawStr}`);
 
         // 改进的 SSE 事件解析：匹配 :message-typeevent 后面的 JSON 数据
@@ -1387,6 +1388,9 @@ async saveCredentialsToFile(filePath, newData) {
                             toolCalls.push(currentToolCallDict);
                             currentToolCallDict = null;
                         }
+                    } else if (eventData.contextUsagePercentage !== undefined) {
+                        // 捕获 contextUsagePercentage
+                        contextUsagePercentage = eventData.contextUsagePercentage;
                     } else if (!eventData.followupPrompt && eventData.content) {
                         // 处理内容，移除转义字符
                         let decodedContent = eventData.content;
@@ -1425,7 +1429,7 @@ async saveCredentialsToFile(filePath, newData) {
         }
 
         const uniqueToolCalls = deduplicateToolCalls(toolCalls);
-        return { content: fullContent || '', toolCalls: uniqueToolCalls };
+        return { content: fullContent || '', toolCalls: uniqueToolCalls, contextUsagePercentage };
     }
  
 
@@ -1792,13 +1796,23 @@ async saveCredentialsToFile(filePath, newData) {
         const response = await this.callApi('', finalModel, requestBody, false, 0, sessionId);
 
         try {
-            const { responseText, toolCalls } = this._processApiResponse(response);
+            const { responseText, toolCalls, contextUsagePercentage } = this._processApiResponse(response);
             const result = this.buildClaudeResponse(responseText, false, 'assistant', model, toolCalls, inputTokens);
             
-            // Add cache tokens to usage object
+            // Add cache tokens to usage object and adjust input_tokens
             if (result && result.usage) {
+                // 如果有 contextUsagePercentage，使用它计算 input_tokens
+                if (contextUsagePercentage !== null && contextUsagePercentage > 0) {
+                    const totalTokens = Math.round(KIRO_CONSTANTS.TOTAL_CONTEXT_TOKENS * contextUsagePercentage / 100);
+                    const outputTokens = result.usage.output_tokens || 0;
+                    inputTokens = Math.max(0, totalTokens - outputTokens);
+                    logger.info(`[Kiro] Non-stream token calculation from contextUsagePercentage: total=${totalTokens}, output=${outputTokens}, input=${inputTokens}`);
+                }
+                
                 result.usage.cache_creation_input_tokens = cacheResult.cache_creation_input_tokens;
                 result.usage.cache_read_input_tokens = cacheResult.cache_read_input_tokens;
+                // input_tokens 应该是未缓存的部分，缓存部分单独计费
+                result.usage.input_tokens = Math.max(0, inputTokens - cacheResult.cache_read_input_tokens - cacheResult.cache_creation_input_tokens);
             }
             
             return result;
@@ -2273,6 +2287,8 @@ async saveCredentialsToFile(filePath, newData) {
             let currentToolCall = null; // 用于累积结构化工具调用
 
             // 1. 先发送 message_start 事件
+            // input_tokens 以 contextUsagePercentage 为准，message_start 阶段尚未知最终值
+            const initialUncachedInputTokens = 0;
             yield {
                 type: "message_start",
                 message: {
@@ -2281,7 +2297,7 @@ async saveCredentialsToFile(filePath, newData) {
                     role: "assistant",
                     model: model,
                     usage: {
-                        input_tokens: estimatedInputTokens,
+                        input_tokens: initialUncachedInputTokens,
                         output_tokens: 0,
                         cache_creation_input_tokens: cacheResult.cache_creation_input_tokens,
                         cache_read_input_tokens: cacheResult.cache_read_input_tokens
@@ -2526,11 +2542,13 @@ async saveCredentialsToFile(filePath, newData) {
             }
 
             // 4. 发送 message_delta 事件
+            // input_tokens 以 contextUsagePercentage 为准，缓存部分单独计费
+            const finalUncachedInputTokens = Math.max(0, inputTokens - cacheResult.cache_read_input_tokens - cacheResult.cache_creation_input_tokens);
             yield {
                 type: "message_delta",
                 delta: { stop_reason: toolCalls.length > 0 ? "tool_use" : "end_turn" },
                 usage: {
-                    input_tokens: inputTokens,
+                    input_tokens: finalUncachedInputTokens,
                     output_tokens: outputTokens,
                     cache_creation_input_tokens: cacheResult.cache_creation_input_tokens,
                     cache_read_input_tokens: cacheResult.cache_read_input_tokens

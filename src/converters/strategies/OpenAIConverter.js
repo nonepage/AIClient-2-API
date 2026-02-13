@@ -121,6 +121,10 @@ export class OpenAIConverter extends BaseConverter {
             return openaiModels;
         }
 
+        const promptTokens = openaiResponse.usage?.prompt_tokens || 0;
+        const cachedTokens = openaiResponse.usage?.prompt_tokens_details?.cached_tokens || 0;
+        const uncachedInputTokens = Math.max(0, promptTokens - cachedTokens);
+
         return {
             ...openaiModels,
             data: openaiModels.data.map(model => ({
@@ -361,9 +365,9 @@ export class OpenAIConverter extends BaseConverter {
             stop_reason: stopReason,
             stop_sequence: null,
             usage: {
-                input_tokens: openaiResponse.usage?.prompt_tokens || 0,
+                input_tokens: uncachedInputTokens,
                 cache_creation_input_tokens: 0,
-                cache_read_input_tokens: openaiResponse.usage?.prompt_tokens_details?.cached_tokens || 0,
+                cache_read_input_tokens: cachedTokens,
                 output_tokens: openaiResponse.usage?.completion_tokens || 0
             }
         };
