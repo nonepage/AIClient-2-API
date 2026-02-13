@@ -4,6 +4,7 @@ import { getServiceAdapter } from './adapter.js';
 import logger from '../utils/logger.js';
 import { MODEL_PROVIDER, getProtocolPrefix } from '../utils/common.js';
 import { getProviderModels } from './provider-models.js';
+import { broadcastEvent } from '../ui-modules/event-broadcast.js';
 import axios from 'axios';
 
 /**
@@ -455,6 +456,90 @@ export class ProviderPoolManager {
         const levels = { debug: 0, info: 1, warn: 2, error: 3 };
         if (levels[level] >= levels[this.logLevel]) {
             logger[level](`[ProviderPoolManager] ${message}`);
+        }
+    }
+
+    /**
+     * 记录健康状态变化日志
+     * @param {string} providerType - 提供商类型
+     * @param {object} providerConfig - 提供商配置
+     * @param {string} fromStatus - 之前状态
+     * @param {string} toStatus - 当前状态
+     * @param {string} [errorMessage] - 错误信息（可选）
+     * @private
+     */
+    _logHealthStatusChange(providerType, providerConfig, fromStatus, toStatus, errorMessage = null) {
+        const customName = providerConfig.customName || providerConfig.uuid;
+        const timestamp = new Date().toISOString();
+        
+        const logEntry = {
+            timestamp,
+            providerType,
+            uuid: providerConfig.uuid,
+            customName,
+            fromStatus,
+            toStatus,
+            errorMessage,
+            usageCount: providerConfig.usageCount || 0,
+            errorCount: providerConfig.errorCount || 0
+        };
+        
+        // 输出详细的状态变化日志
+        if (toStatus === 'unhealthy') {
+            logger.warn(`[HealthMonitor] ⚠️ Provider became UNHEALTHY: ${customName} (${providerType})`);
+            logger.warn(`[HealthMonitor]    Reason: ${errorMessage || 'Unknown'}`);
+            logger.warn(`[HealthMonitor]    Error Count: ${providerConfig.errorCount}`);
+            
+            // 触发告警（如果配置了 Webhook）
+            this._triggerHealthAlert(providerType, providerConfig, 'unhealthy', errorMessage);
+        } else if (toStatus === 'healthy' && fromStatus === 'unhealthy') {
+            logger.info(`[HealthMonitor] ✅ Provider recovered to HEALTHY: ${customName} (${providerType})`);
+            
+            // 触发恢复通知
+            this._triggerHealthAlert(providerType, providerConfig, 'recovered', null);
+        }
+        
+        // 广播健康状态变化事件
+        broadcastEvent('health_status_change', logEntry);
+    }
+
+    /**
+     * 触发健康状态告警
+     * @param {string} providerType - 提供商类型
+     * @param {object} providerConfig - 提供商配置
+     * @param {string} status - 状态 ('unhealthy' | 'recovered')
+     * @param {string} [errorMessage] - 错误信息
+     * @private
+     */
+    async _triggerHealthAlert(providerType, providerConfig, status, errorMessage = null) {
+        const webhookUrl = this.globalConfig?.HEALTH_ALERT_WEBHOOK_URL;
+        if (!webhookUrl) {
+            return; // 未配置 Webhook，跳过
+        }
+        
+        const customName = providerConfig.customName || providerConfig.uuid;
+        const payload = {
+            timestamp: new Date().toISOString(),
+            providerType,
+            uuid: providerConfig.uuid,
+            customName,
+            status,
+            errorMessage,
+            stats: {
+                usageCount: providerConfig.usageCount || 0,
+                errorCount: providerConfig.errorCount || 0
+            }
+        };
+        
+        try {
+            const axios = (await import('axios')).default;
+            await axios.post(webhookUrl, payload, {
+                timeout: 5000,
+                headers: { 'Content-Type': 'application/json' }
+            });
+            this._log('info', `Health alert sent to webhook for ${customName}: ${status}`);
+        } catch (error) {
+            this._log('error', `Failed to send health alert to webhook: ${error.message}`);
         }
     }
 
@@ -946,6 +1031,7 @@ export class ProviderPoolManager {
 
         const provider = this._findProvider(providerType, providerConfig.uuid);
         if (provider) {
+            const wasHealthy = provider.config.isHealthy;
             const now = Date.now();
             const lastErrorTime = provider.config.lastErrorTime ? new Date(provider.config.lastErrorTime).getTime() : 0;
             const errorWindowMs = 10000; // 10 秒窗口期
@@ -968,6 +1054,12 @@ export class ProviderPoolManager {
 
             if (this.maxErrorCount > 0 && provider.config.errorCount >= this.maxErrorCount) {
                 provider.config.isHealthy = false;
+                
+                // 健康状态变化日志
+                if (wasHealthy) {
+                    this._logHealthStatusChange(providerType, provider.config, 'healthy', 'unhealthy', errorMessage);
+                }
+                
                 this._log('warn', `Marked provider as unhealthy: ${providerConfig.uuid} for type ${providerType}. Total errors: ${provider.config.errorCount}`);
             } 
 
@@ -990,6 +1082,7 @@ export class ProviderPoolManager {
 
         const provider = this._findProvider(providerType, providerConfig.uuid);
         if (provider) {
+            const wasHealthy = provider.config.isHealthy;
             provider.config.isHealthy = false;
             provider.config.errorCount = this.maxErrorCount; // Set to max to indicate definitive failure
             provider.config.lastErrorTime = new Date().toISOString();
@@ -997,6 +1090,11 @@ export class ProviderPoolManager {
 
             if (errorMessage) {
                 provider.config.lastErrorMessage = errorMessage;
+            }
+
+            // 健康状态变化日志
+            if (wasHealthy) {
+                this._logHealthStatusChange(providerType, provider.config, 'healthy', 'unhealthy', errorMessage);
             }
 
             this._log('warn', `Immediately marked provider as unhealthy: ${providerConfig.uuid} for type ${providerType}. Reason: ${errorMessage || 'Authentication error'}`);
@@ -1058,6 +1156,7 @@ export class ProviderPoolManager {
 
         const provider = this._findProvider(providerType, providerConfig.uuid);
         if (provider) {
+            const wasHealthy = provider.config.isHealthy;
             provider.config.isHealthy = true;
             provider.config.errorCount = 0;
             provider.config.refreshCount = 0;
@@ -1078,6 +1177,12 @@ export class ProviderPoolManager {
                 provider.config.usageCount++;
                 provider.config.lastUsed = new Date().toISOString();
             }
+            
+            // 健康状态变化日志
+            if (!wasHealthy) {
+                this._logHealthStatusChange(providerType, provider.config, 'unhealthy', 'healthy', null);
+            }
+            
             this._log('info', `Marked provider as healthy: ${provider.config.uuid} for type ${providerType}${resetUsageCount ? ' (usage count reset)' : ''}`);
             
             this._debouncedSave(providerType);
