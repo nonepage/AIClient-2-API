@@ -499,20 +499,28 @@ export class RedisCacheService {
 
             // If no cache hit, create all breakpoints
             if (result.cache_read_input_tokens === 0 && breakpoints.length > 0) {
+                logger.info(`[Redis Cache] Creating ${breakpoints.length} new cache entries`);
                 let prevTokens = 0;
                 for (const bp of breakpoints) {
                     const key = `cache:${sessionId}:${bp.hash}`;
                     
+                    logger.debug(`[Redis Cache] Creating breakpoint: hash=${bp.hash.substring(0, 8)}..., tokens=${bp.tokens}, ttl=${bp.ttl}`);
+                    
                     try {
                         await this.client.setex(key, bp.ttl, bp.tokens);
+                        logger.debug(`[Redis Cache] Successfully created cache entry: ${key}`);
                     } catch (e) {
                         logger.warn(`[Redis Cache] Failed to create cache for ${key}: ${e.message}`);
                     }
 
                     const additionalTokens = bp.tokens - prevTokens;
                     result.cache_creation_input_tokens += additionalTokens;
+                    logger.debug(`[Redis Cache] Added ${additionalTokens} tokens to creation count (total: ${result.cache_creation_input_tokens})`);
                     prevTokens = bp.tokens;
                 }
+                logger.info(`[Redis Cache] Finished creating cache entries, total creation tokens: ${result.cache_creation_input_tokens}`);
+            } else {
+                logger.debug(`[Redis Cache] Skipping cache creation: cache_read=${result.cache_read_input_tokens}, breakpoints=${breakpoints.length}`);
             }
 
             // Calculate uncached tokens
