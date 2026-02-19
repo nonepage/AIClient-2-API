@@ -1790,7 +1790,7 @@ async saveCredentialsToFile(filePath, newData) {
 
         try {
             const redisService = getRedisService(this.config);
-            if (redisService.isEnabled) {
+            if (redisService.isEnabled && requestBody.metadata) {
                 logger.info(`[Kiro] [Redis Cache] Enabled, initializing for session: ${sessionId}`);
                 await redisService.initialize();
                 
@@ -1804,6 +1804,8 @@ async saveCredentialsToFile(filePath, newData) {
                 cacheResult = await redisService.lookupOrCreate(sessionId, breakpoints, inputTokens);
                 
                 logger.info(`[Kiro] [Redis Cache] Result: read=${cacheResult.cache_read_input_tokens}, creation=${cacheResult.cache_creation_input_tokens}, uncached=${cacheResult.uncached_input_tokens}`);
+            } else if (redisService.isEnabled && !requestBody.metadata) {
+                logger.debug(`[Kiro] [Redis Cache] Skipped: no metadata field in request`);
             } else {
                 logger.debug(`[Kiro] [Redis Cache] Disabled, skipping local cache`);
             }
@@ -2206,7 +2208,7 @@ async saveCredentialsToFile(filePath, newData) {
 
         try {
             const redisService = getRedisService(this.config);
-            if (redisService.isEnabled) {
+            if (redisService.isEnabled && requestBody.metadata) {
                 logger.info(`[Kiro] [Redis Cache] Enabled, initializing for session: ${sessionId}`);
                 await redisService.initialize();
                 
@@ -2220,6 +2222,8 @@ async saveCredentialsToFile(filePath, newData) {
                 cacheResult = await redisService.lookupOrCreate(sessionId, breakpoints, estimatedInputTokens);
                 
                 logger.info(`[Kiro] [Redis Cache] Result: read=${cacheResult.cache_read_input_tokens}, creation=${cacheResult.cache_creation_input_tokens}, uncached=${cacheResult.uncached_input_tokens}`);
+            } else if (redisService.isEnabled && !requestBody.metadata) {
+                logger.debug(`[Kiro] [Redis Cache] Skipped: no metadata field in request`);
             } else {
                 logger.debug(`[Kiro] [Redis Cache] Disabled, skipping local cache`);
             }
