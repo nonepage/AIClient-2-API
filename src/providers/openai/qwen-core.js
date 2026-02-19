@@ -19,7 +19,7 @@ import { getProviderPoolManager } from '../../services/service-manager.js';
 const QWEN_DIR = '.qwen';
 const QWEN_CREDENTIAL_FILENAME = 'oauth_creds.json';
 // 从 provider-models.js 获取支持的模型列表
-const QWEN_MODELS = getProviderModels('openai-qwen-oauth');
+const QWEN_MODELS = getProviderModels(MODEL_PROVIDER.QWEN_API);
 const QWEN_MODEL_LIST = QWEN_MODELS.map(id => ({
     id: id,
     name: id.split('-').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ')
@@ -35,7 +35,7 @@ const DEFAULT_LOCK_CONFIG = {
 };
 
 const DEFAULT_QWEN_OAUTH_BASE_URL = 'https://chat.qwen.ai';
-const DEFAULT_QWEN_BASE_URL = 'https://portal.qwen.ai/v1';
+const DEFAULT_QWEN_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
 const QWEN_OAUTH_CLIENT_ID = 'f0304373b74a44d2b584a3fb70ca9e56';
 const QWEN_OAUTH_SCOPE = 'openid profile email model.completion';
 const QWEN_OAUTH_GRANT_TYPE = 'urn:ietf:params:oauth:grant-type:device_code';
@@ -531,7 +531,7 @@ export class QwenApiService {
         const maxRetries = (this.config && this.config.REQUEST_MAX_RETRIES) || 3;
         const baseDelay = (this.config && this.config.REQUEST_BASE_DELAY) || 1000;
 
-        const version = "0.2.1";
+        const version = "0.10.1";
         const userAgent = `QwenCode/${version} (${process.platform}; ${process.arch})`;
         logger.info(`[QwenApiService] User-Agent: ${userAgent}`);
 
@@ -645,7 +645,7 @@ export class QwenApiService {
                 return this.callApiWithAuthAndRetry(endpoint, body, isStream, retryCount + 1);
             }
 
-            logger.error(`[QwenApiService] Error calling API (Status: ${status}, Code: ${errorCode}):`, data);
+            logger.error(`[QwenApiService] Error calling API (Status: ${status}, Code: ${errorCode}):`, errorMessage);
             throw error;
         }
     }

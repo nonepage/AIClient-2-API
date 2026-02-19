@@ -9,6 +9,7 @@ AIClient-2-API 是一个统一的 AI API 代理服务器，支持多种 AI 提�
 - 提供商池管理与健康检查
 - OAuth 凭证自动刷新
 - 插件系统支持
+- Redis 提示词缓存（基于 Anthropic Prompt Caching 机制）
 
 ## 构建/测试命令
 
@@ -175,7 +176,46 @@ export const MODEL_PROTOCOL_PREFIX = {
     CLAUDE: 'claude',
     // ...
 };
+
+## Redis 提示词缓存系统
+
+本项目实现了基于 Redis 的提示词缓存功能，遵循 Anthropic Prompt Caching 的前缀匹配机制，可显著降低 API 调用成本。
+
+### 缓存原理
+
+- **前缀匹配**：只对包含 `cache_control` 标记的内容计算哈希
+- **断点机制**：每个 `cache_control` 标记创建一个缓存断点（breakpoint）
+- **累积哈希**：使用 SHA-256 计算内容的累积哈希值
+- **TTL 管理**：支持 1 小时 TTL，缓存命中时自动刷新
+
+### 配置方法
+
+通过环境变量或 `configs/config.json` 配置 Redis 连接：
+
+```json
+{
+  "REDIS_ENABLED": true,
+  "REDIS_HOST": "localhost",
+  "REDIS_PORT": 6379,
+  "REDIS_PASSWORD": "",
+  "REDIS_DB": 0
+}
 ```
+
+### Token 计费说明
+
+缓存系统会在 usage 对象中返回三个字段：
+
+- `cache_read_input_tokens`：从缓存读取的 tokens（缓存命中）
+- `cache_creation_input_tokens`：写入缓存的 tokens（缓存未命中）
+- `input_tokens`：未缓存的 tokens（实际计费部分）
+
+### 使用注意事项
+
+- 缓存功能目前仅支持 Kiro 提供商
+- 需要在请求中正确设置 `cache_control` 标记
+- Redis 服务需要独立部署和维护
+- 缓存键格式：`cache:{sessionId}:{hash}`
 
 ## 项目结构
 
@@ -194,11 +234,13 @@ src/
 ├── services/       # 核心服务
 │   ├── api-server.js
 │   ├── service-manager.js
-│   └── provider-pool-manager.js
+│   ├── provider-pool-manager.js
+│   └── redis-cache.js  # Redis 缓存服务
 ├── utils/          # 工具函数
 │   ├── common.js
 │   ├── logger.js
-│   └── provider-strategies.js
+│   ├── provider-strategies.js
+│   └── crypto-utils.js # 哈希计算工具（用于缓存）
 └── ui-modules/     # UI 管理 API
 
 tests/              # 测试文件

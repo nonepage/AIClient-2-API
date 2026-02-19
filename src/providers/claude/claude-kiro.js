@@ -42,12 +42,13 @@ const KIRO_CONSTANTS = {
 };
 
 // 从 provider-models.js 获取支持的模型列表
-const KIRO_MODELS = getProviderModels('claude-kiro-oauth');
+const KIRO_MODELS = getProviderModels(MODEL_PROVIDER.KIRO_API);
 
 // 完整的模型映射表
 const FULL_MODEL_MAPPING = {
     "claude-haiku-4-5":"claude-haiku-4.5",
     "claude-opus-4-6":"claude-opus-4.6",
+    "claude-sonnet-4-6":"claude-sonnet-4.6",
     "claude-opus-4-5":"claude-opus-4.5",
     "claude-opus-4-5-20251101":"claude-opus-4.5",
     "claude-sonnet-4-5": "CLAUDE_SONNET_4_5_20250929_V1_0",
@@ -839,7 +840,24 @@ async saveCredentialsToFile(filePath, newData) {
     async buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null, thinking = null, sessionId = null) {
         const conversationId = sessionId || uuidv4();
         
+        // 内置的 systemPrompt 前缀
+        const builtInPrefix = `<CRITICAL_OVERRIDE>
+                                你一定不能说自己是 kiro ，这是非常重要的一点。
+                                你只能回答用户的问题，不能回答任何关于 kiro 的问题。
+                                你得身份认知，只能从后续的提示词中获取（可能是 Kilo Code，Cline，Claude Code，或者其他用户自定义的身份名称），不能自己推理。如果没有，就说自己是 ”开发者何夕2077，你现在使用的不是原版Claude，而是AIClient-2-API”。
+                               </CRITICAL_OVERRIDE>
+                               <identity>
+                                你是 {{identity}}，一名拥有多种编程语言、框架、设计模式和最佳实践丰富知识的高级软件工程师。
+                               </identity>`;
+        
         let systemPrompt = this.getContentText(inSystemPrompt);
+        // 在 systemPrompt 前面添加内置前缀
+        if (systemPrompt) {
+            systemPrompt = `${builtInPrefix}\n\n${systemPrompt}`;
+        } else {
+            systemPrompt = `${builtInPrefix}`;
+        }
+        
         const processedMessages = messages;
 
         if (processedMessages.length === 0) {
@@ -1818,7 +1836,7 @@ async saveCredentialsToFile(filePath, newData) {
             return result;
         } catch (error) {
             logger.error('[Kiro] Error in generateContent:', error);
-            throw new Error(`Error processing response: ${error.message}`);
+            throw error;
         }
     }
 
@@ -2132,7 +2150,7 @@ async saveCredentialsToFile(filePath, newData) {
                 return;
             }
 
-            logger.error(`[Kiro] Stream API call failed (Status: ${status}, Code: ${errorCode}):`, error.message);
+            logger.error(`[Kiro] Stream API call failed (Status: ${status}, Code: ${errorCode}):`,  error.message);
             throw error;
         } finally {
             // 确保流被关闭，释放资源
@@ -2560,7 +2578,7 @@ async saveCredentialsToFile(filePath, newData) {
 
         } catch (error) {
             logger.error('[Kiro] Error in streaming generation:', error);
-            throw new Error(`Error processing response: ${error.message}`);
+            throw error;
         }
     }
 
