@@ -10,18 +10,20 @@ import * as https from 'https';
 import { getProviderModels } from '../provider-models.js';
 import { countTokens } from '@anthropic-ai/tokenizer';
 import { configureAxiosProxy } from '../../utils/proxy-utils.js';
-import { isRetryableNetworkError, MODEL_PROVIDER, formatExpiryLog } from '../../utils/common.js';
+import { isRetryableNetworkError, MODEL_PROVIDER, formatExpiryLog, normalizeSessionIdFromUserId } from '../../utils/common.js';
 import { getProviderPoolManager } from '../../services/service-manager.js';
 import { hashString } from '../../utils/crypto-utils.js';
 import { getRedisService } from '../../services/redis-cache.js';
 
 const KIRO_THINKING = {
+    MIN_BUDGET_TOKENS: 1024,
     MAX_BUDGET_TOKENS: 24576,
     DEFAULT_BUDGET_TOKENS: 20000,
     START_TAG: '<thinking>',
     END_TAG: '</thinking>',
     MODE_TAG: '<thinking_mode>',
     MAX_LEN_TAG: '<max_thinking_length>',
+    EFFORT_TAG: '<thinking_effort>',
 };
 
 const KIRO_CONSTANTS = {
@@ -392,11 +394,11 @@ export class KiroApiService {
      * @private
      */
     _extractSessionId(requestBody) {
-        // Log metadata for debugging
+        // Log metadata for debugging (avoid full metadata leakage)
         try {
-            const metadataStr = JSON.stringify(requestBody?.metadata || {});
-            const truncated = metadataStr.length > 500 ? metadataStr.substring(0, 500) + '...' : metadataStr;
-            logger.info(`[Kiro] Request metadata: ${truncated}`);
+            const userId = requestBody?.metadata?.user_id;
+            const safeUserMarker = userId ? `${hashString(String(userId)).substring(0, 12)}...` : 'none';
+            logger.info(`[Kiro] Request metadata received (user_marker=${safeUserMarker})`);
         } catch (err) {
             logger.warn(`[Kiro] Failed to log metadata: ${err.message}`);
         }
@@ -405,16 +407,11 @@ export class KiroApiService {
         const userId = requestBody?.metadata?.user_id;
         
         if (userId) {
-            // Try pattern match: _session_{uuid} (matches any format with _session_ prefix)
-            const match = userId.match(/_session_([a-f0-9-]{36})/i);
-            if (match && match[1]) {
-                logger.info(`[Kiro] Session UUID extracted from metadata: ${match[1]}`);
-                return match[1];
+            const normalizedSessionId = normalizeSessionIdFromUserId(userId);
+            if (normalizedSessionId) {
+                logger.info(`[Kiro] Session ID derived from metadata (prefix=${normalizedSessionId.substring(0, 12)}...)`);
+                return normalizedSessionId;
             }
-            
-            // Fallback: hash the entire user_id
-            logger.info(`[Kiro] Session UUID pattern not matched in user_id: ${userId.substring(0, 50)}..., using hash of user_id`);
-            return hashString(userId);
         }
         
         // Fallback: use API key if available
@@ -789,18 +786,32 @@ async saveCredentialsToFile(filePath, newData) {
             value = KIRO_THINKING.DEFAULT_BUDGET_TOKENS;
         }
         value = Math.floor(value);
+        if (value < KIRO_THINKING.MIN_BUDGET_TOKENS) value = KIRO_THINKING.MIN_BUDGET_TOKENS;
         return Math.min(value, KIRO_THINKING.MAX_BUDGET_TOKENS);
     }
 
     _generateThinkingPrefix(thinking) {
-        if (!thinking || thinking.type !== 'enabled') return null;
-        const budget = this._normalizeThinkingBudgetTokens(thinking.budget_tokens);
-        return `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>`;
+        if (!thinking || typeof thinking !== 'object') return null;
+        const type = String(thinking.type || '').toLowerCase().trim();
+
+        if (type === 'enabled') {
+            const budget = this._normalizeThinkingBudgetTokens(thinking.budget_tokens);
+            return `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>`;
+        }
+
+        if (type === 'adaptive') {
+            const effortRaw = typeof thinking.effort === 'string' ? thinking.effort : '';
+            const effort = effortRaw.toLowerCase().trim();
+            const normalizedEffort = (effort === 'low' || effort === 'medium' || effort === 'high') ? effort : 'high';
+            return `<thinking_mode>adaptive</thinking_mode><thinking_effort>${normalizedEffort}</thinking_effort>`;
+        }
+
+        return null;
     }
 
     _hasThinkingPrefix(text) {
         if (!text) return false;
-        return text.includes(KIRO_THINKING.MODE_TAG) || text.includes(KIRO_THINKING.MAX_LEN_TAG);
+        return text.includes(KIRO_THINKING.MODE_TAG) || text.includes(KIRO_THINKING.MAX_LEN_TAG) || text.includes(KIRO_THINKING.EFFORT_TAG);
     }
 
     _toClaudeContentBlocksFromKiroText(content) {
@@ -1778,7 +1789,7 @@ async saveCredentialsToFile(filePath, newData) {
         logger.info(`[Kiro] Calling generateContent with model: ${finalModel}`);
         
         // Estimate input tokens before making the API call
-        const inputTokens = this.estimateInputTokens(requestBody);
+        let inputTokens = this.estimateInputTokens(requestBody);
         
         // Redis prompt caching - extract session and compute cache
         const sessionId = this._extractSessionId(requestBody);
@@ -1833,6 +1844,15 @@ async saveCredentialsToFile(filePath, newData) {
                 result.usage.cache_read_input_tokens = cacheResult.cache_read_input_tokens;
                 // input_tokens 应该是未缓存的部分，缓存部分单独计费
                 result.usage.input_tokens = Math.max(0, inputTokens - cacheResult.cache_read_input_tokens - cacheResult.cache_creation_input_tokens);
+
+                const cachedTokens = result.usage.cache_creation_input_tokens + result.usage.cache_read_input_tokens;
+                const accountedTotal = result.usage.input_tokens + cachedTokens;
+                if (accountedTotal > inputTokens) {
+                    logger.warn(
+                        `[Kiro] Usage invariant warning (non-stream): accounted=${accountedTotal} > input=${inputTokens}, ` +
+                        `read=${result.usage.cache_read_input_tokens}, creation=${result.usage.cache_creation_input_tokens}`
+                    );
+                }
             }
             
             return result;
@@ -2566,6 +2586,15 @@ async saveCredentialsToFile(filePath, newData) {
             // 4. 发送 message_delta 事件
             // input_tokens 以 contextUsagePercentage 为准，缓存部分单独计费
             const finalUncachedInputTokens = Math.max(0, inputTokens - cacheResult.cache_read_input_tokens - cacheResult.cache_creation_input_tokens);
+
+            const streamAccountedTotal = finalUncachedInputTokens + cacheResult.cache_read_input_tokens + cacheResult.cache_creation_input_tokens;
+            if (streamAccountedTotal > inputTokens) {
+                logger.warn(
+                    `[Kiro] Usage invariant warning (stream): accounted=${streamAccountedTotal} > input=${inputTokens}, ` +
+                    `read=${cacheResult.cache_read_input_tokens}, creation=${cacheResult.cache_creation_input_tokens}`
+                );
+            }
+
             yield {
                 type: "message_delta",
                 delta: { stop_reason: toolCalls.length > 0 ? "tool_use" : "end_turn" },
@@ -2612,9 +2641,17 @@ async saveCredentialsToFile(filePath, newData) {
         }
         
         // Count thinking prefix tokens if thinking is enabled
-        if (requestBody.thinking?.type === 'enabled') {
-            const budget = this._normalizeThinkingBudgetTokens(requestBody.thinking.budget_tokens);
-            allText += `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>`;
+        if (requestBody.thinking?.type && typeof requestBody.thinking.type === 'string') {
+            const t = requestBody.thinking.type.toLowerCase().trim();
+            if (t === 'enabled') {
+                const budget = this._normalizeThinkingBudgetTokens(requestBody.thinking.budget_tokens);
+                allText += `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>`;
+            } else if (t === 'adaptive') {
+                const effortRaw = typeof requestBody.thinking.effort === 'string' ? requestBody.thinking.effort : '';
+                const effort = effortRaw.toLowerCase().trim();
+                const normalizedEffort = (effort === 'low' || effort === 'medium' || effort === 'high') ? effort : 'high';
+                allText += `<thinking_mode>adaptive</thinking_mode><thinking_effort>${normalizedEffort}</thinking_effort>`;
+            }
         }
         
         // Count all messages tokens

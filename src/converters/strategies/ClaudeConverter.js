@@ -312,6 +312,17 @@ export class ClaudeConverter extends BaseConverter {
 
         // 检查是否包含 tool_use
         const hasToolUse = claudeResponse.content.some(block => block && block.type === 'tool_use');
+
+        // Extract thinking blocks into OpenAI-style `reasoning_content`.
+        let reasoningContent = '';
+        if (Array.isArray(claudeResponse.content)) {
+            for (const block of claudeResponse.content) {
+                if (!block || typeof block !== 'object') continue;
+                if (block.type === 'thinking') {
+                    reasoningContent += (block.thinking ?? block.text ?? '');
+                }
+            }
+        }
         
         let message = {
             role: "assistant",
@@ -347,6 +358,10 @@ export class ClaudeConverter extends BaseConverter {
         } else {
             // 处理普通文本响应
             message.content = this.processClaudeResponseContent(claudeResponse.content);
+        }
+
+        if (reasoningContent) {
+            message.reasoning_content = reasoningContent;
         }
 
         // 处理 finish_reason
