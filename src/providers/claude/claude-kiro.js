@@ -125,6 +125,42 @@ function findRealTag(text, tag, startIndex = 0) {
     }
 }
 
+function isWhitespaceOnly(text) {
+    if (text === null || text === undefined) return true;
+    return String(text).trim().length === 0;
+}
+
+/**
+ * Find a "real" thinking end tag that is not quoted/backticked and is followed by '\n\n'.
+ * This avoids prematurely closing a thinking block when the model mentions `</thinking>`
+ * inside the thinking content.
+ */
+function findRealThinkingEndTag(buffer, startIndex = 0) {
+    let searchStart = Math.max(0, startIndex);
+    while (true) {
+        const pos = findRealTag(buffer, KIRO_THINKING.END_TAG, searchStart);
+        if (pos === -1) return -1;
+        const after = buffer.slice(pos + KIRO_THINKING.END_TAG.length);
+        if (after.startsWith('\n\n')) return pos;
+        searchStart = pos + 1;
+    }
+}
+
+/**
+ * Find a "real" thinking end tag only when it is at the buffer end (after it is whitespace only).
+ * This is used for boundary-event scenarios (tool_use starts immediately after thinking, or stream end).
+ */
+function findRealThinkingEndTagAtBufferEnd(buffer, startIndex = 0) {
+    let searchStart = Math.max(0, startIndex);
+    while (true) {
+        const pos = findRealTag(buffer, KIRO_THINKING.END_TAG, searchStart);
+        if (pos === -1) return -1;
+        const after = buffer.slice(pos + KIRO_THINKING.END_TAG.length);
+        if (isWhitespaceOnly(after)) return pos;
+        searchStart = pos + 1;
+    }
+}
+
 /**
  * 通用的括号匹配函数 - 支持多种括号类型
  * @param {string} text - 要搜索的文本
@@ -825,8 +861,14 @@ async saveCredentialsToFile(filePath, newData) {
         
         const before = raw.slice(0, startPos);
         let rest = raw.slice(startPos + KIRO_THINKING.START_TAG.length);
-        
-        const endPosInRest = findRealTag(rest, KIRO_THINKING.END_TAG);
+
+        // Strip a single leading newline after `<thinking>` for cleaner blocks.
+        if (rest.startsWith('\r\n')) rest = rest.slice(2);
+        else if (rest.startsWith('\n')) rest = rest.slice(1);
+
+        let endPosInRest = findRealThinkingEndTag(rest);
+        if (endPosInRest === -1) endPosInRest = findRealThinkingEndTagAtBufferEnd(rest);
+
         let thinking = '';
         let after = '';
         if (endPosInRest === -1) {
@@ -837,11 +879,12 @@ async saveCredentialsToFile(filePath, newData) {
         }
         
         if (after.startsWith('\n\n')) after = after.slice(2);
+        if (isWhitespaceOnly(after)) after = '';
         
         const blocks = [];
-        if (before) blocks.push({ type: "text", text: before });
+        if (before && !isWhitespaceOnly(before)) blocks.push({ type: "text", text: before });
         blocks.push({ type: "thinking", thinking });
-        if (after) blocks.push({ type: "text", text: after });
+        if (after && !isWhitespaceOnly(after)) blocks.push({ type: "text", text: after });
         return blocks;
     }
 
@@ -1828,7 +1871,14 @@ async saveCredentialsToFile(filePath, newData) {
 
         try {
             const { responseText, toolCalls, contextUsagePercentage } = this._processApiResponse(response);
-            const result = this.buildClaudeResponse(responseText, false, 'assistant', model, toolCalls, inputTokens);
+            // Extended thinking support: convert Kiro text to Claude content blocks when thinking is requested
+            const thinkingType = requestBody?.thinking?.type;
+            const thinkingRequested = typeof thinkingType === 'string' &&
+                (thinkingType.toLowerCase() === 'enabled' || thinkingType.toLowerCase() === 'adaptive');
+            const contentForClaude = thinkingRequested
+                ? this._toClaudeContentBlocksFromKiroText(responseText)
+                : responseText;
+            const result = this.buildClaudeResponse(contentForClaude, false, 'assistant', model, toolCalls, inputTokens);
             
             // Add cache tokens to usage object and adjust input_tokens
             if (result && result.usage) {
@@ -2215,7 +2265,9 @@ async saveCredentialsToFile(filePath, newData) {
         let contextUsagePercentage = null;
         const messageId = `${uuidv4()}`;
 
-        const thinkingRequested = requestBody?.thinking?.type === 'enabled';
+        const thinkingType = requestBody?.thinking?.type;
+        const thinkingRequested = typeof thinkingType === 'string' &&
+            (thinkingType.toLowerCase() === 'enabled' || thinkingType.toLowerCase() === 'adaptive');
 
         // Redis prompt caching - extract session and compute cache
         const sessionId = this._extractSessionId(requestBody);
@@ -2254,12 +2306,15 @@ async saveCredentialsToFile(filePath, newData) {
         const streamState = {
             thinkingRequested,
             buffer: '',
+            pendingTextBeforeThinking: '',
             inThinking: false,
             thinkingExtracted: false,
             thinkingBlockIndex: null,
             textBlockIndex: null,
             nextBlockIndex: 0,
             stoppedBlocks: new Set(),
+            stripThinkingLeadingNewline: false,
+            stripTextLeadingNewlinesAfterThinking: false,
         };
 
         const ensureBlockStart = (blockType) => {
@@ -2369,24 +2424,58 @@ async saveCredentialsToFile(filePath, newData) {
                             const startPos = findRealTag(streamState.buffer, KIRO_THINKING.START_TAG);
                             if (startPos !== -1) {
                                 const before = streamState.buffer.slice(0, startPos);
-                                if (before) events.push(...createTextDeltaEvents(before));
+                                const beforeCombined = `${streamState.pendingTextBeforeThinking}${before}`;
+                                // Avoid creating meaningless text blocks before thinking.
+                                if (beforeCombined && !isWhitespaceOnly(beforeCombined)) {
+                                    events.push(...createTextDeltaEvents(beforeCombined));
+                                }
+                                streamState.pendingTextBeforeThinking = '';
 
                                 streamState.buffer = streamState.buffer.slice(startPos + KIRO_THINKING.START_TAG.length);
                                 streamState.inThinking = true;
+                                streamState.stripThinkingLeadingNewline = true;
                                 continue;
                             }
 
                             const safeLen = Math.max(0, streamState.buffer.length - KIRO_THINKING.START_TAG.length);
                             if (safeLen > 0) {
                                 const safeText = streamState.buffer.slice(0, safeLen);
-                                if (safeText) events.push(...createTextDeltaEvents(safeText));
+                                if (safeText) {
+                                    if (isWhitespaceOnly(safeText)) {
+                                        // Buffer whitespace until we know whether a thinking block appears.
+                                        // This prevents a leading text block from being created before thinking.
+                                        const maxKeep = 1024;
+                                        const remaining = maxKeep - streamState.pendingTextBeforeThinking.length;
+                                        if (remaining > 0) {
+                                            streamState.pendingTextBeforeThinking += safeText.slice(0, remaining);
+                                        }
+                                    } else {
+                                        const combined = `${streamState.pendingTextBeforeThinking}${safeText}`;
+                                        streamState.pendingTextBeforeThinking = '';
+                                        events.push(...createTextDeltaEvents(combined));
+                                    }
+                                }
                                 streamState.buffer = streamState.buffer.slice(safeLen);
                             }
                             break;
                         }
 
                         if (streamState.inThinking) {
-                            const endPos = findRealTag(streamState.buffer, KIRO_THINKING.END_TAG);
+                            // Strip a single leading newline after `<thinking>` (may be split across chunks).
+                            if (streamState.stripThinkingLeadingNewline) {
+                                if (streamState.buffer.startsWith('\r\n')) {
+                                    streamState.buffer = streamState.buffer.slice(2);
+                                    streamState.stripThinkingLeadingNewline = false;
+                                } else if (streamState.buffer.startsWith('\n')) {
+                                    streamState.buffer = streamState.buffer.slice(1);
+                                    streamState.stripThinkingLeadingNewline = false;
+                                } else if (streamState.buffer.length > 0) {
+                                    streamState.stripThinkingLeadingNewline = false;
+                                }
+                            }
+
+                            let endPos = findRealThinkingEndTag(streamState.buffer);
+                            if (endPos === -1) endPos = findRealThinkingEndTagAtBufferEnd(streamState.buffer);
                             if (endPos !== -1) {
                                 const thinkingPart = streamState.buffer.slice(0, endPos);
                                 if (thinkingPart) events.push(...createThinkingDeltaEvents(thinkingPart));
@@ -2394,13 +2483,13 @@ async saveCredentialsToFile(filePath, newData) {
                                 streamState.buffer = streamState.buffer.slice(endPos + KIRO_THINKING.END_TAG.length);
                                 streamState.inThinking = false;
                                 streamState.thinkingExtracted = true;
+                                streamState.stripThinkingLeadingNewline = false;
 
                                 events.push(...createThinkingDeltaEvents(""));
                                 events.push(...stopBlock(streamState.thinkingBlockIndex));
 
-                                if (streamState.buffer.startsWith('\n\n')) {
-                                    streamState.buffer = streamState.buffer.slice(2);
-                                }
+                                // Strip '\n\n' after the end tag once we switch back to text (may arrive in next chunk).
+                                streamState.stripTextLeadingNewlinesAfterThinking = true;
                                 continue;
                             }
 
@@ -2414,8 +2503,13 @@ async saveCredentialsToFile(filePath, newData) {
                         }
 
                         if (streamState.thinkingExtracted) {
-                            const rest = streamState.buffer;
+                            let rest = streamState.buffer;
                             streamState.buffer = '';
+                            if (streamState.stripTextLeadingNewlinesAfterThinking) {
+                                if (rest.startsWith('\r\n\r\n')) rest = rest.slice(4);
+                                else if (rest.startsWith('\n\n')) rest = rest.slice(2);
+                                streamState.stripTextLeadingNewlinesAfterThinking = false;
+                            }
                             if (rest) events.push(...createTextDeltaEvents(rest));
                             break;
                         }
@@ -2496,18 +2590,33 @@ async saveCredentialsToFile(filePath, newData) {
                 currentToolCall = null;
             }
 
-            if (thinkingRequested && streamState.buffer) {
+            if (thinkingRequested && (streamState.inThinking || streamState.buffer || streamState.pendingTextBeforeThinking)) {
                 if (streamState.inThinking) {
                     logger.warn('[Kiro] Incomplete thinking tag at stream end');
+                    // Strip a single leading newline after `<thinking>` if we haven't yet.
+                    if (streamState.stripThinkingLeadingNewline) {
+                        if (streamState.buffer.startsWith('\r\n')) streamState.buffer = streamState.buffer.slice(2);
+                        else if (streamState.buffer.startsWith('\n')) streamState.buffer = streamState.buffer.slice(1);
+                        streamState.stripThinkingLeadingNewline = false;
+                    }
                     yield* pushEvents(createThinkingDeltaEvents(streamState.buffer));
                     streamState.buffer = '';
                     yield* pushEvents(createThinkingDeltaEvents(""));
                     yield* pushEvents(stopBlock(streamState.thinkingBlockIndex));
                 } else if (!streamState.thinkingExtracted) {
-                    yield* pushEvents(createTextDeltaEvents(streamState.buffer));
+                    const remaining = `${streamState.pendingTextBeforeThinking}${streamState.buffer}`;
+                    streamState.pendingTextBeforeThinking = '';
+                    if (remaining) yield* pushEvents(createTextDeltaEvents(remaining));
                     streamState.buffer = '';
                 } else {
-                    yield* pushEvents(createTextDeltaEvents(streamState.buffer));
+                    let remaining = streamState.buffer;
+                    streamState.buffer = '';
+                    if (streamState.stripTextLeadingNewlinesAfterThinking) {
+                        if (remaining.startsWith('\r\n\r\n')) remaining = remaining.slice(4);
+                        else if (remaining.startsWith('\n\n')) remaining = remaining.slice(2);
+                        streamState.stripTextLeadingNewlinesAfterThinking = false;
+                    }
+                    if (remaining) yield* pushEvents(createTextDeltaEvents(remaining));
                     streamState.buffer = '';
                 }
             }
@@ -2801,9 +2910,31 @@ async saveCredentialsToFile(filePath, newData) {
         } else {
             // Non-streaming response (full message object)
             const contentArray = [];
-            let stopReason = "end_turn";
             let outputTokens = 0;
 
+            // 1) Content blocks (text/thinking) first.
+            if (Array.isArray(content)) {
+                for (const block of content) {
+                    if (!block || typeof block !== 'object') continue;
+                    if (block.type === 'text' && typeof block.text === 'string') {
+                        contentArray.push({ type: 'text', text: block.text });
+                        outputTokens += this.countTextTokens(block.text);
+                    } else if (block.type === 'thinking' && typeof block.thinking === 'string') {
+                        contentArray.push({ type: 'thinking', thinking: block.thinking });
+                        outputTokens += this.countTextTokens(block.thinking);
+                    } else if (typeof block.text === 'string' && block.text) {
+                        // Best-effort fallback for unknown blocks carrying plain text.
+                        contentArray.push({ type: 'text', text: block.text });
+                        outputTokens += this.countTextTokens(block.text);
+                    }
+                }
+            } else if (content) {
+                contentArray.push({ type: "text", text: content });
+                outputTokens += this.countTextTokens(content);
+            }
+
+            // 2) Append tool_use blocks (if any).
+            let stopReason = "end_turn";
             if (toolCalls && toolCalls.length > 0) {
                 for (const tc of toolCalls) {
                     let inputObject;
@@ -3068,4 +3199,3 @@ async saveCredentialsToFile(filePath, newData) {
         }
     }
 }
-

@@ -403,16 +403,29 @@ export async function getApiServiceWithFallback(config, requestedModel = null, o
     
     if (providerPoolManager && config.providerPools && config.providerPools[config.MODEL_PROVIDER]) {
         // selectProviderWithFallback 现在是异步的，使用链式锁确保并发安全
+        // 如果开启了并发限制，则使用 acquireSlot 进行选择和占位
+        const useAcquire = options.acquireSlot === true;
         // 支持 sessionId 用于 session affinity（同一用户优先使用同一账号）
-        const selectOptions = { 
-            skipUsageCount: true,
+        const mergedOptions = {
+            ...options,
             ...(options.sessionId && { sessionId: options.sessionId })
         };
-        const selectedResult = await providerPoolManager.selectProviderWithFallback(
-            config.MODEL_PROVIDER,
-            requestedModel,
-            selectOptions
-        );
+        let selectedResult;
+        
+        if (useAcquire) {
+             // 我们需要一个支持 Fallback 的 acquireSlot
+             selectedResult = await providerPoolManager.acquireSlotWithFallback(
+                config.MODEL_PROVIDER,
+                requestedModel,
+                mergedOptions
+            );
+        } else {
+            selectedResult = await providerPoolManager.selectProviderWithFallback(
+                config.MODEL_PROVIDER,
+                requestedModel,
+                { ...mergedOptions, skipUsageCount: true }
+            );
+        }
         
         if (selectedResult) {
             const { config: selectedProviderConfig, actualProviderType: selectedType, isFallback: fallbackUsed, actualModel: fallbackModel } = selectedResult;
@@ -507,7 +520,8 @@ export async function getProviderStatus(config, options = {}) {
         'openai-qwen-oauth': 'QWEN_OAUTH_CREDS_FILE_PATH',
         'gemini-antigravity': 'ANTIGRAVITY_OAUTH_CREDS_FILE_PATH',
         'openai-iflow': 'IFLOW_TOKEN_FILE_PATH',
-        'forward-api': 'FORWARD_BASE_URL'
+        'forward-api': 'FORWARD_BASE_URL',
+        'grok-custom': 'GROK_COOKIE_TOKEN'
     };
     let providerPoolsSlim = [];
     let unhealthyProvideIdentifyList = [];
