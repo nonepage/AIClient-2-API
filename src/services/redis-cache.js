@@ -55,6 +55,7 @@ export class RedisCacheService {
         this.config = config;
         this.client = null;
         this.isInitialized = false;
+        this._initPromise = null; // 防止并发初始化
         
         // Environment variables take priority over config file
         this.isEnabled = this._getEnvBool('REDIS_ENABLED', config.REDIS_ENABLED ?? false);
@@ -97,6 +98,30 @@ export class RedisCacheService {
      * @returns {Promise<void>}
      */
     async initialize() {
+        if (this.isInitialized) {
+            return;
+        }
+
+        // 防止并发初始化：多个请求同时到达时，只有第一个执行实际初始化
+        // 后续请求等待同一个 Promise 完成
+        if (this._initPromise) {
+            return this._initPromise;
+        }
+
+        this._initPromise = this._doInitialize();
+        try {
+            await this._initPromise;
+        } finally {
+            this._initPromise = null;
+        }
+    }
+
+    /**
+     * Internal initialization logic
+     * @private
+     */
+    async _doInitialize() {
+        // Double-check after acquiring the "lock"
         if (this.isInitialized) {
             return;
         }
@@ -490,7 +515,12 @@ export class RedisCacheService {
                                     result.cache_creation_input_tokens += additionalTokens;
                                     createdBreakpoints++;
                                 } else {
+                                    // 并发请求已创建此 breakpoint，将其 tokens 算作 read
+                                    // 同时回退之前错误计入 creation 的部分
                                     existingBreakpoints++;
+                                    result.cache_read_input_tokens = laterBp.tokens;
+                                    result.cache_creation_input_tokens = 0;
+                                    logger.debug(`[Redis Cache] Race on subsequent bp ${j}: corrected read=${laterBp.tokens}, reset creation=0`);
                                 }
                             } catch (e) {
                                 logger.warn(`[Redis Cache] Failed to create cache for ${laterKey}: ${e.message}`);
@@ -511,7 +541,10 @@ export class RedisCacheService {
             if (result.cache_read_input_tokens === 0 && breakpoints.length > 0) {
                 logger.info(`[Redis Cache] Creating ${breakpoints.length} new cache entries`);
                 let prevTokens = 0;
-                for (const bp of breakpoints) {
+                // 追踪第一个 NX 失败的 breakpoint 索引，用于正确处理并发竞争
+                let firstRaceIndex = -1;
+                for (let bpIdx = 0; bpIdx < breakpoints.length; bpIdx++) {
+                    const bp = breakpoints[bpIdx];
                     const key = `cache:${sessionId}:${bp.hash}`;
                     
                     logger.debug(`[Redis Cache] Creating breakpoint: hash=${bp.hash.substring(0, 8)}..., tokens=${bp.tokens}, ttl=${bp.ttl}`);
@@ -525,9 +558,18 @@ export class RedisCacheService {
                             logger.debug(`[Redis Cache] Successfully created cache entry: ${key}`);
                             logger.debug(`[Redis Cache] Added ${additionalTokens} tokens to creation count (total: ${result.cache_creation_input_tokens})`);
                         } else {
-                            // 其他并发请求已经创建，按 read 统计补偿
+                            // 并发请求已创建此 breakpoint
+                            // 此 breakpoint 及之前所有 breakpoint 的 tokens 应算作 cache_read
+                            // 之前我们可能已经把部分 tokens 算作 creation（NX 成功的），需要修正
                             existingBreakpoints++;
-                            result.cache_read_input_tokens = Math.max(result.cache_read_input_tokens, bp.tokens);
+                            if (firstRaceIndex === -1) {
+                                firstRaceIndex = bpIdx;
+                            }
+                            // 这个 breakpoint 已存在于 Redis，它的 tokens 全部算 read
+                            // 把之前错误计入 creation 的部分回退
+                            result.cache_read_input_tokens = bp.tokens;
+                            result.cache_creation_input_tokens = 0;
+                            logger.debug(`[Redis Cache] Race detected at breakpoint ${bpIdx}: corrected read=${bp.tokens}, reset creation=0`);
                         }
                     } catch (e) {
                         logger.warn(`[Redis Cache] Failed to create cache for ${key}: ${e.message}`);

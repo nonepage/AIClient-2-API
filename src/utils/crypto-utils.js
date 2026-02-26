@@ -94,29 +94,43 @@ function normalizeToolForHash(tool) {
  */
 class CumulativeHasher {
     constructor() {
-        this.buffer = '';
+        // 使用增量式 hash 替代字符串拼接，避免高并发时 buffer 无限增长占用大量内存
+        this._hash = crypto.createHash('sha256');
+        // 保存每次 update 后的中间 hash 值，用于 getCurrentHash
+        this._currentDigest = null;
+        this._dirty = true;
     }
     
     /**
-     * Adds data to the cumulative buffer
+     * Adds data to the cumulative hash
      * @param {string} data - Data to add
      * @returns {CumulativeHasher} - Returns this for method chaining
      */
     update(data) {
-        this.buffer += data;
+        this._hash.update(data, 'utf8');
+        this._dirty = true;
+        this._currentDigest = null;
         return this;
     }
     
     /**
      * Gets the current hash without finalizing
+     * Creates a copy of the internal hash state to avoid consuming it
      * @returns {string} - Current SHA256 hash of accumulated data
      */
     getCurrentHash() {
-        return crypto.createHash('sha256').update(this.buffer, 'utf8').digest('hex');
+        if (!this._dirty && this._currentDigest) {
+            return this._currentDigest;
+        }
+        // copy() 创建 hash 状态的副本，不会消耗原始 hash 对象
+        this._currentDigest = this._hash.copy().digest('hex');
+        this._dirty = false;
+        return this._currentDigest;
     }
     
     /**
      * Finalizes and returns the hash
+     * After calling finalize(), the hasher should not be used for further updates
      * @returns {string} - Final SHA256 hash
      */
     finalize() {
@@ -124,10 +138,12 @@ class CumulativeHasher {
     }
     
     /**
-     * Resets the hasher buffer
+     * Resets the hasher to initial state
      */
     reset() {
-        this.buffer = '';
+        this._hash = crypto.createHash('sha256');
+        this._currentDigest = null;
+        this._dirty = true;
     }
 }
 
